@@ -1,0 +1,256 @@
+<!doctype html>
+<html lang="ar" dir="rtl">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <meta name="theme-color" content="#0b78d1">
+  <title>سقّاية — اطلب الماء</title>
+  <link rel="stylesheet" href="/vendor/leaflet/leaflet.css">
+  <link rel="stylesheet" href="/style.css">
+</head>
+<body>
+  <header>
+    <div>
+      <h1>💧 سقّاية</h1>
+      <small>اطلب ماء الشرب، والشاحنة تجيك لباب الدار</small>
+    </div>
+    <a href="/driver" style="color:#fff;font-size:.85rem">أنا سائق</a>
+  </header>
+
+  <main>
+    <!-- ===== نموذج الطلب ===== -->
+    <section id="orderForm">
+      <div class="card">
+        <h2>1. شحال من لتر تحب؟</h2>
+        <div class="chips" id="literChips">
+          <button type="button" class="chip" data-l="50">50 ل</button>
+          <button type="button" class="chip active" data-l="100">100 ل</button>
+          <button type="button" class="chip" data-l="200">200 ل</button>
+          <button type="button" class="chip" data-l="500">500 ل</button>
+        </div>
+        <label for="liters">ولا اكتب الكمية باللتر</label>
+        <input id="liters" type="number" inputmode="numeric" min="20" max="20000" value="100">
+        <p class="hint" id="priceHint"></p>
+      </div>
+
+      <div class="card">
+        <h2>2. وين راك؟</h2>
+        <button type="button" class="secondary block" id="locateBtn">📍 استعمل موقعي (GPS)</button>
+        <p class="hint">ولا اضغط على الخريطة باش تحط الدبوس في بلاصة الدار.</p>
+        <div id="pickMap" class="map" style="margin-top:10px"></div>
+        <p class="hint" id="locHint">ما حددتش الموقع مازال.</p>
+      </div>
+
+      <div class="card">
+        <h2>3. معلوماتك</h2>
+        <label for="name">الاسم</label>
+        <input id="name" autocomplete="name">
+        <label for="phone">رقم الهاتف</label>
+        <input id="phone" type="tel" inputmode="tel" autocomplete="tel" placeholder="05XXXXXXXX">
+        <label for="note">ملاحظة للسائق (اختياري)</label>
+        <textarea id="note" placeholder="مثلاً: الباب الأزرق قدام الجامع"></textarea>
+        <p class="error" id="formError"></p>
+        <button class="block" id="submitBtn">أرسل الطلب</button>
+      </div>
+    </section>
+
+    <!-- ===== متابعة الطلب ===== -->
+    <section id="tracking" class="hidden">
+      <div class="card">
+        <span class="badge" id="tBadge"></span>
+        <div class="status-big" id="tStatus"></div>
+        <div class="steps"><span></span><span></span><span></span></div>
+        <div id="tInfo" class="meta"></div>
+        <div id="tDriver" style="margin-top:10px"></div>
+      </div>
+      <div class="card">
+        <div id="trackMap" class="map tall"></div>
+        <p class="hint" id="tDistance"></p>
+      </div>
+      <div class="row">
+        <button class="danger" id="cancelBtn">إلغاء الطلب</button>
+        <button class="secondary hidden" id="newBtn">طلب جديد</button>
+      </div>
+      <p class="error" id="trackError"></p>
+    </section>
+  </main>
+
+  <script src="/vendor/leaflet/leaflet.js"></script>
+  <script src="/socket.io/socket.io.js"></script>
+  <script src="/common.js"></script>
+  <script>
+    const socket = io();
+    const $ = (id) => document.getElementById(id);
+    let pricePer100L = 0;
+    let picked = null;
+    let pickMarker = null;
+
+    fetch('/api/config').then((r) => r.json()).then((c) => {
+      pricePer100L = c.pricePer100L || 0;
+      updatePrice();
+    }).catch(() => {});
+
+    // ----- الكمية -----
+    const chips = [...document.querySelectorAll('#literChips .chip')];
+    chips.forEach((c) => c.addEventListener('click', () => {
+      $('liters').value = c.dataset.l;
+      syncChips();
+    }));
+    $('liters').addEventListener('input', syncChips);
+    function syncChips() {
+      chips.forEach((c) => c.classList.toggle('active', c.dataset.l === $('liters').value));
+      updatePrice();
+    }
+    function updatePrice() {
+      const l = Number($('liters').value) || 0;
+      $('priceHint').textContent = pricePer100L && l ? `السعر التقريبي: ${Math.round((l / 100) * pricePer100L)} دج` : '';
+    }
+
+    // ----- الموقع -----
+    const pickMap = makeMap('pickMap');
+    function setPicked(lat, lng, source) {
+      picked = { lat, lng };
+      if (!pickMarker) {
+        pickMarker = L.marker([lat, lng], { icon: icon('🏠'), draggable: true }).addTo(pickMap);
+        pickMarker.on('dragend', () => {
+          const p = pickMarker.getLatLng();
+          setPicked(p.lat, p.lng, 'الخريطة');
+        });
+      } else pickMarker.setLatLng([lat, lng]);
+      $('locHint').textContent = `✅ الموقع محدد (${source}). تقدر تجرّ الدبوس باش تصحّحو.`;
+    }
+    pickMap.on('click', (e) => setPicked(e.latlng.lat, e.latlng.lng, 'الخريطة'));
+
+    $('locateBtn').addEventListener('click', () => {
+      if (!navigator.geolocation) return ($('locHint').textContent = 'التيليفون ما يدعمش GPS — حط الدبوس على الخريطة.');
+      $('locHint').textContent = '⏳ راني نجيب موقعك...';
+      navigator.geolocation.getCurrentPosition(
+        (p) => {
+          setPicked(p.coords.latitude, p.coords.longitude, 'GPS');
+          pickMap.setView([p.coords.latitude, p.coords.longitude], 17);
+        },
+        () => ($('locHint').textContent = '⚠️ ما قدرتش نجيب الموقع. فعّل GPS واسمح للمتصفح، ولا حط الدبوس على الخريطة.'),
+        { enableHighAccuracy: true, timeout: 15000 }
+      );
+    });
+
+    // نحفظو الاسم والهاتف للمرة الجاية
+    const saved = store('customer') || {};
+    $('name').value = saved.name || '';
+    $('phone').value = saved.phone || '';
+
+    // ----- إرسال الطلب -----
+    $('submitBtn').addEventListener('click', () => {
+      $('formError').textContent = '';
+      if (!picked) return ($('formError').textContent = 'حدّد موقعك أولاً (الخطوة 2).');
+      const data = {
+        liters: Number($('liters').value),
+        lat: picked.lat,
+        lng: picked.lng,
+        name: $('name').value,
+        phone: $('phone').value,
+        note: $('note').value,
+      };
+      $('submitBtn').disabled = true;
+      socket.emit('order:create', data, (res) => {
+        $('submitBtn').disabled = false;
+        if (res.error) return ($('formError').textContent = res.error);
+        store('customer', { name: data.name, phone: data.phone });
+        store('activeOrder', { id: res.order.id, token: res.token });
+        showTracking(res.order);
+      });
+    });
+
+    // ----- المتابعة -----
+    let trackMap, homeMarker, truckMarker, current;
+    function showTracking(order) {
+      current = order;
+      $('orderForm').classList.add('hidden');
+      $('tracking').classList.remove('hidden');
+      if (!trackMap) {
+        trackMap = makeMap('trackMap', [order.lat, order.lng], 15);
+        homeMarker = L.marker([order.lat, order.lng], { icon: icon('🏠') }).addTo(trackMap);
+      } else {
+        homeMarker.setLatLng([order.lat, order.lng]);
+        trackMap.setView([order.lat, order.lng], 15);
+      }
+      setTimeout(() => trackMap.invalidateSize(), 50);
+      renderOrder(order);
+    }
+
+    function renderOrder(o) {
+      current = o;
+      $('tBadge').className = 'badge ' + o.status;
+      $('tBadge').textContent = STATUS_LABEL[o.status];
+      const msg = {
+        pending: 'طلبك وصل للسائقين، استنّى شوية حتى واحد يقبلو...',
+        accepted: '🚚 السائق قبل طلبك وراهو جاي!',
+        arrived: '🚚 الشاحنة وصلت! اخرج بالدلاء.',
+        done: '✅ تمّ التوصيل. صحّة!',
+        cancelled: 'تلغى الطلب.',
+      };
+      $('tStatus').textContent = msg[o.status];
+      const step = { pending: 1, accepted: 2, arrived: 3, done: 3, cancelled: 0 }[o.status];
+      document.querySelectorAll('#tracking .steps span').forEach((s, i) => s.classList.toggle('on', i < step));
+      $('tInfo').innerHTML = `الكمية: <b>${o.liters} لتر</b>${o.price ? ` · السعر: <b>${o.price} دج</b>` : ''}`;
+
+      const d = o.driver;
+      if (d && (o.status === 'accepted' || o.status === 'arrived')) {
+        $('tDriver').innerHTML = `السائق: <b>${esc(d.name)}</b> · <a href="tel:${esc(d.phone)}">📞 عيّط للسائق</a>`;
+        if (d.lat != null) moveTruck(d);
+      } else {
+        $('tDriver').textContent = '';
+        if (truckMarker) { truckMarker.remove(); truckMarker = null; }
+        $('tDistance').textContent = '';
+      }
+
+      const finished = o.status === 'done' || o.status === 'cancelled';
+      $('cancelBtn').classList.toggle('hidden', !(o.status === 'pending' || o.status === 'accepted'));
+      $('newBtn').classList.toggle('hidden', !finished);
+      if (finished) store('activeOrder', null);
+
+      if (o.status === 'arrived' && navigator.vibrate) navigator.vibrate([300, 150, 300]);
+    }
+
+    function moveTruck(pos) {
+      if (!truckMarker) {
+        truckMarker = L.marker([pos.lat, pos.lng], { icon: icon('🚚') }).addTo(trackMap);
+        trackMap.fitBounds(L.latLngBounds([[pos.lat, pos.lng], [current.lat, current.lng]]).pad(0.3));
+      } else truckMarker.setLatLng([pos.lat, pos.lng]);
+      const km = distanceKm(pos, current);
+      $('tDistance').textContent = km != null ? `🚚 الشاحنة بعيدة عليك ${fmtKm(km)}` : '';
+    }
+
+    socket.on('order', (o) => current && o.id === current.id && renderOrder(o));
+    socket.on('driver:location', (pos) => {
+      if (current && (current.status === 'accepted' || current.status === 'arrived')) moveTruck(pos);
+    });
+
+    $('cancelBtn').addEventListener('click', () => {
+      if (!confirm('متأكد تحب تلغي الطلب؟')) return;
+      const a = store('activeOrder');
+      socket.emit('order:cancel', { id: current.id, token: a && a.token }, (res) => {
+        $('trackError').textContent = res.error || '';
+      });
+    });
+    $('newBtn').addEventListener('click', () => {
+      store('activeOrder', null);
+      current = null;
+      $('tracking').classList.add('hidden');
+      $('orderForm').classList.remove('hidden');
+      setTimeout(() => pickMap.invalidateSize(), 50);
+    });
+
+    // نرجعو للطلب الحالي إذا الزبون سكّر الصفحة وحلّها من جديد
+    function resume() {
+      const a = store('activeOrder');
+      if (!a) return;
+      socket.emit('order:watch', a.id, (res) => {
+        if (res.error) return store('activeOrder', null);
+        showTracking(res.order);
+      });
+    }
+    socket.on('connect', resume);
+  </script>
+</body>
+</html>

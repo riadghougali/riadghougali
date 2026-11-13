@@ -1,0 +1,231 @@
+<!doctype html>
+<html lang="ar" dir="rtl">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <meta name="theme-color" content="#0b78d1">
+  <title>سقّاية — السائق</title>
+  <link rel="stylesheet" href="/vendor/leaflet/leaflet.css">
+  <link rel="stylesheet" href="/style.css">
+</head>
+<body>
+  <header>
+    <div>
+      <h1>🚚 سقّاية — السائق</h1>
+      <small id="hdrSub">الطلبات تاع الماء حولك</small>
+    </div>
+    <button class="secondary hidden" id="logoutBtn" style="color:#fff;border-color:#fff;padding:6px 10px">خروج</button>
+  </header>
+
+  <main>
+    <!-- ===== الدخول ===== -->
+    <section id="login" class="card">
+      <h2>دخول السائق</h2>
+      <label for="dName">الاسم</label>
+      <input id="dName" autocomplete="name">
+      <label for="dPhone">رقم الهاتف</label>
+      <input id="dPhone" type="tel" inputmode="tel" autocomplete="tel">
+      <label for="dCode">رمز الدخول</label>
+      <input id="dCode" type="password" inputmode="numeric">
+      <p class="error" id="loginError"></p>
+      <button class="block" id="loginBtn">دخول</button>
+    </section>
+
+    <!-- ===== لوحة السائق ===== -->
+    <section id="panel" class="hidden">
+      <div class="card">
+        <div class="row" style="align-items:center">
+          <div class="switch"><span id="gpsDot">⚪</span> <span id="gpsText">GPS مطفي</span></div>
+          <label class="switch" style="margin:0;justify-content:flex-end">
+            <input type="checkbox" id="soundOn" checked style="width:auto"> صوت الطلبات الجديدة
+          </label>
+        </div>
+        <div id="dMap" class="map tall" style="margin-top:10px"></div>
+      </div>
+
+      <div class="card">
+        <h2>طلباتي</h2>
+        <div id="myOrders"></div>
+      </div>
+
+      <div class="card">
+        <h2>طلبات جديدة <span class="badge" id="pendingCount">0</span></h2>
+        <p class="hint">مرتّبين من الأقرب للأبعد.</p>
+        <div id="pendingOrders"></div>
+      </div>
+    </section>
+  </main>
+
+  <script src="/vendor/leaflet/leaflet.js"></script>
+  <script src="/socket.io/socket.io.js"></script>
+  <script src="/common.js"></script>
+  <script>
+    const socket = io();
+    const $ = (id) => document.getElementById(id);
+    let me = null;            // { driverId, name, phone }
+    let myPos = null;
+    let orders = [];
+    let map, meMarker, watchId;
+    const orderMarkers = new Map();
+
+    const saved = store('driver') || {};
+    $('dName').value = saved.name || '';
+    $('dPhone').value = saved.phone || '';
+    $('dCode').value = saved.code || '';
+
+    function login(creds, silent) {
+      socket.emit('driver:login', creds, (res) => {
+        if (res.error) {
+          if (!silent) $('loginError').textContent = res.error;
+          return;
+        }
+        me = { driverId: res.driverId, name: creds.name, phone: creds.phone };
+        store('driver', creds);
+        $('login').classList.add('hidden');
+        $('panel').classList.remove('hidden');
+        $('logoutBtn').classList.remove('hidden');
+        $('hdrSub').textContent = 'مرحبا ' + creds.name;
+        startMap();
+        startGps();
+        setOrders(res.orders);
+      });
+    }
+    $('loginBtn').addEventListener('click', () => {
+      $('loginError').textContent = '';
+      login({ name: $('dName').value, phone: $('dPhone').value, code: $('dCode').value });
+    });
+    // دخول تلقائي وعند رجوع الاتصال
+    socket.on('connect', () => {
+      const c = store('driver');
+      if (c && c.code) login(c, true);
+    });
+    $('logoutBtn').addEventListener('click', () => {
+      store('driver', { name: $('dName').value, phone: $('dPhone').value });
+      location.reload();
+    });
+
+    // ----- الخريطة و GPS -----
+    function startMap() {
+      if (map) return;
+      map = makeMap('dMap');
+      setTimeout(() => map.invalidateSize(), 50);
+    }
+    function startGps() {
+      if (watchId != null) return;
+      if (!navigator.geolocation) return setGps('⚠️', 'التيليفون ما يدعمش GPS');
+      setGps('⏳', 'راني نجيب موقعك...');
+      let first = true;
+      watchId = navigator.geolocation.watchPosition(
+        (p) => {
+          myPos = { lat: p.coords.latitude, lng: p.coords.longitude };
+          socket.emit('driver:location', myPos);
+          setGps('🟢', 'GPS يخدم — الزبائن يشوفو الشاحنة');
+          if (!meMarker) meMarker = L.marker([myPos.lat, myPos.lng], { icon: icon('🚚'), zIndexOffset: 1000 }).addTo(map);
+          else meMarker.setLatLng([myPos.lat, myPos.lng]);
+          if (first) { map.setView([myPos.lat, myPos.lng], 14); first = false; }
+          render();
+        },
+        () => setGps('🔴', 'فعّل GPS واسمح للمتصفح باش الطلبات يترتبو والزبائن يشوفوك'),
+        { enableHighAccuracy: true, maximumAge: 5000 }
+      );
+    }
+    function setGps(dot, text) { $('gpsDot').textContent = dot; $('gpsText').textContent = text; }
+
+    // ----- الطلبات -----
+    function setOrders(list) {
+      orders = list;
+      render();
+    }
+    socket.on('orders', setOrders);
+    socket.on('order:new', () => {
+      if ($('soundOn').checked) beep();
+      if (navigator.vibrate) navigator.vibrate([200, 100, 200]);
+    });
+
+    function render() {
+      if (!me) return;
+      const withDist = orders.map((o) => ({ ...o, km: distanceKm(myPos, o) }));
+      const mine = withDist.filter((o) => o.driverId === me.driverId);
+      const pending = withDist.filter((o) => o.status === 'pending')
+        .sort((a, b) => (a.km ?? 1e9) - (b.km ?? 1e9) || a.createdAt - b.createdAt);
+
+      $('pendingCount').textContent = pending.length;
+      $('myOrders').innerHTML = mine.length ? mine.map((o) => card(o, true)).join('') : '<div class="empty">ما عندك حتى طلب مقبول.</div>';
+      $('pendingOrders').innerHTML = pending.length ? pending.map((o) => card(o, false)).join('') : '<div class="empty">ما كاين حتى طلب جديد دروك.</div>';
+
+      // علامات الخريطة
+      const visible = new Set();
+      for (const o of [...mine, ...pending]) {
+        visible.add(o.id);
+        const emoji = o.driverId === me.driverId ? '🏠' : '💧';
+        let m = orderMarkers.get(o.id);
+        if (!m) {
+          m = L.marker([o.lat, o.lng], { icon: icon(emoji) }).addTo(map);
+          orderMarkers.set(o.id, m);
+        } else m.setIcon(icon(emoji));
+        m.bindPopup(`<b>${o.liters} لتر</b><br>${esc(o.name)}`);
+      }
+      for (const [id, m] of orderMarkers) if (!visible.has(id)) { m.remove(); orderMarkers.delete(id); }
+    }
+
+    function card(o, mine) {
+      const nav = `https://www.google.com/maps/dir/?api=1&destination=${o.lat},${o.lng}`;
+      let actions;
+      if (!mine) {
+        actions = `<button class="block" onclick="setStatus('${o.id}','accepted')">✅ قبول الطلب</button>`;
+      } else {
+        actions = `
+          <div class="row">
+            <a href="${nav}" target="_blank" rel="noopener"><button class="secondary block">🧭 الطريق</button></a>
+            <a href="tel:${esc(o.phone)}"><button class="secondary block">📞 عيّط</button></a>
+          </div>
+          <div class="row" style="margin-top:8px">
+            ${o.status === 'accepted' ? `<button onclick="setStatus('${o.id}','arrived')">📍 وصلت</button>` : ''}
+            <button class="ok" onclick="setStatus('${o.id}','done')">✔️ كمّلت</button>
+            <button class="danger" onclick="if(confirm('ترجّع الطلب لسائقين آخرين؟'))setStatus('${o.id}','pending')">↩️ رجّع</button>
+          </div>`;
+      }
+      return `
+        <div class="order ${mine ? 'mine' : ''}">
+          <div class="top">
+            <span class="liters">💧 ${o.liters} لتر</span>
+            <span class="badge ${o.status}">${STATUS_LABEL[o.status]}</span>
+          </div>
+          <div class="meta">
+            ${esc(o.name)}${o.km != null ? ' · 📍 ' + fmtKm(o.km) : ''} · ${fmtTime(o.createdAt)}
+            ${o.price ? ' · ' + o.price + ' دج' : ''}
+          </div>
+          ${o.note ? `<div class="meta">📝 ${esc(o.note)}</div>` : ''}
+          <div class="actions">${actions}</div>
+        </div>`;
+    }
+
+    function setStatus(id, status) {
+      socket.emit('order:status', { id, status }, (res) => {
+        if (res.error) alert(res.error);
+      });
+    }
+
+    // تحديث "قبل كذا دقيقة" كل دقيقة
+    setInterval(render, 60000);
+
+    // صوت تنبيه بسيط بلا ملفات
+    let ctx;
+    function beep() {
+      try {
+        ctx = ctx || new (window.AudioContext || window.webkitAudioContext)();
+        [0, 0.25].forEach((t) => {
+          const o = ctx.createOscillator();
+          const g = ctx.createGain();
+          o.frequency.value = 880;
+          g.gain.setValueAtTime(0.3, ctx.currentTime + t);
+          g.gain.exponentialRampToValueAtTime(0.001, ctx.currentTime + t + 0.2);
+          o.connect(g).connect(ctx.destination);
+          o.start(ctx.currentTime + t);
+          o.stop(ctx.currentTime + t + 0.2);
+        });
+      } catch {}
+    }
+  </script>
+</body>
+</html>
