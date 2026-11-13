@@ -210,7 +210,10 @@ setInterval(() => {
 }, 10 * 60 * 1000);
 
 server.listen(PORT, () => {
-  console.log(`سقّاية راهي تخدم على http://localhost:${PORT}`);
-  console.log(`  تطبيق الزبون:  http://localhost:${PORT}/`);
-  console.log(`  تطبيق السائق: http://localhost:${PORT}/driver   (رمز الدخول: ${DRIVER_CODE === '1234' ? '1234 — بدّلو بـ DRIVER_CODE' : 'من DRIVER_CODE'})`);
+  // في Render نطبعو الرابط الحقيقي، ماشي localhost
+  const base = process.env.RENDER_EXTERNAL_URL || `http://localhost:${PORT}`;
+  console.log(`سقّاية راهي تخدم`);
+  console.log(`  رابط الزبائن:  ${base}/`);
+  console.log(`  رابط السائقين: ${base}/driver`);
+  if (DRIVER_CODE === '1234') console.log('  ⚠️ رمز السائقين هو 1234 — بدّلو بـ DRIVER_CODE');
 });
